@@ -12,6 +12,7 @@ import type { Page } from "playwright-core";
 import { page, pages, setCurrent, context, config } from "./browser.ts";
 import { snapshot, locate } from "./snapshot.ts";
 import { fillLogin } from "./login.ts";
+import { AUTH, describeChallenge, pendingAuth, raceAuth, resetAuth } from "./httpauth.ts";
 
 const server = new McpServer(
   { name: "browser-mcp", version: "0.1.0" },
@@ -19,7 +20,7 @@ const server = new McpServer(
     instructions:
       "A real Chrome with a persistent profile: logins survive between sessions. " +
       "Typical flow: navigate → snapshot (text with [eN] refs) → click/type by ref → snapshot again. " +
-      "Use get_text for long articles. If a page shows a login form or redirects to one, call fill_login: " +
+      "Use get_text for long articles. If a page shows a login form or redirects to one, or navigate reports an HTTP (Basic) login prompt, call fill_login: " +
       "it fills credentials from the user's Bitwarden after the user confirms in a local dialog; you never see " +
       "the password, and the type tool refuses password fields. If fill_login finds nothing to use, ask the user. " +
       "CAPTCHAs and logins the tool cannot fill are for the user to do in the visible browser window.",
@@ -60,10 +61,16 @@ tool(
   { url: z.string().describe("Absolute URL, or back / forward / reload") },
   async ({ url }) => {
     const p = await page();
-    if (url === "back") await p.goBack({ timeout: 30000 });
-    else if (url === "forward") await p.goForward({ timeout: 30000 });
-    else if (url === "reload") await p.reload({ timeout: 30000 });
-    else await p.goto(/^[a-z]+:/i.test(url) ? url : `https://${url}`, { timeout: 30000, waitUntil: "domcontentloaded" });
+    resetAuth(p);
+    const nav =
+      url === "back" ? p.goBack({ timeout: 30000 })
+      : url === "forward" ? p.goForward({ timeout: 30000 })
+      : url === "reload" ? p.reload({ timeout: 30000 })
+      : p.goto(/^[a-z]+:/i.test(url) ? url : `https://${url}`, { timeout: 30000, waitUntil: "domcontentloaded" });
+    nav.catch(() => undefined); // may settle after we return (auth challenge answered later)
+    if ((await raceAuth(p, nav)) === AUTH) {
+      return text(`${describeChallenge(pendingAuth(p)!)}. Call fill_login to answer it from Bitwarden.`);
+    }
     await settle(p);
     return text(`${await where(p)}\nCall snapshot to see the page.`);
   },

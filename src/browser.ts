@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { watchAuth } from "./httpauth.ts";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 
 const PORT = Number(process.env.BROWSER_MCP_PORT ?? 9333);
@@ -48,6 +49,7 @@ async function launchChrome(): Promise<void> {
     `--user-data-dir=${PROFILE}`,
     `--remote-debugging-port=${PORT}`,
     "--remote-debugging-address=127.0.0.1",
+    "--class=browser-mcp",
     "--no-first-run",
     "--no-default-browser-check",
     "--password-store=basic",
@@ -85,9 +87,11 @@ export async function context(): Promise<BrowserContext> {
 /** The page this server is working on; opens one if needed. */
 export async function page(): Promise<Page> {
   const ctx = await context();
-  if (current && !current.isClosed()) return current;
-  const pages = ctx.pages().filter((p) => !p.isClosed());
-  current = pages.at(-1) ?? (await ctx.newPage());
+  if (!current || current.isClosed()) {
+    const pages = ctx.pages().filter((p) => !p.isClosed());
+    current = pages.at(-1) ?? (await ctx.newPage());
+  }
+  await watchAuth(ctx, current).catch(() => undefined);
   return current;
 }
 

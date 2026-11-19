@@ -15,7 +15,7 @@ function zenity(args: string[], timeoutSec: number): Promise<{ outcome: Outcome;
       const code = err ? (typeof err.code === "number" ? err.code : -1) : 0;
       // zenity: 0 = OK, 1 = Cancel/closed, 5 = timeout, anything else = could not show the dialog.
       if (code === 0) resolve({ outcome: "ok", out: stdout });
-      else if (code === 1) resolve({ outcome: "cancelled", out: "" });
+      else if (code === 1) resolve({ outcome: "cancelled", out: stdout }); // extra buttons print their label and exit 1
       else if (code === 5) resolve({ outcome: "timeout", out: "" });
       else {
         const why = stderr.split("\n").find((l) => l.trim() && !l.includes("Gtk-WARNING")) ?? err?.message;
@@ -41,6 +41,23 @@ export async function confirm(title: string, text: string): Promise<boolean> {
   );
   if (outcome === "timeout") throw explain(outcome, "login confirmation");
   return outcome === "ok";
+}
+
+export type Choice = "once" | "always" | "deny";
+
+/** Like confirm, with an extra "always allow" button (only offered when `offerAlways`). */
+export async function confirmChoice(title: string, text: string, offerAlways: boolean): Promise<Choice> {
+  const ALWAYS = "Immer erlauben";
+  const { outcome, out } = await zenity(
+    [
+      "--question", "--modal", `--title=${title}`, `--text=${text}`, "--ok-label=Einloggen", "--cancel-label=Abbrechen",
+      ...(offerAlways ? [`--extra-button=${ALWAYS}`] : []), "--no-markup", "--default-cancel",
+    ],
+    120,
+  );
+  if (outcome === "timeout") throw explain(outcome, "login confirmation");
+  if (outcome === "ok") return "once";
+  return out.trim() === ALWAYS ? "always" : "deny";
 }
 
 export async function askPassword(title: string, text: string): Promise<string> {

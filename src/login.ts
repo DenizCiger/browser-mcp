@@ -4,7 +4,9 @@
 
 import type { Frame, Locator, Page } from "playwright-core";
 import { itemsForUrl, searchItems, secretsFor, type LoginItem } from "./bitwarden.ts";
-import { confirm } from "./dialog.ts";
+import { confirmChoice } from "./dialog.ts";
+import { alwaysAsk, isTrusted, trust } from "./trust.ts";
+import { answerAuth, pendingAuth, type AuthChallenge } from "./httpauth.ts";
 
 const LOGIN_ATTR = "data-bmcp-login";
 
@@ -72,8 +74,76 @@ function itemMatchesHost(item: LoginItem, h: string): boolean {
   });
 }
 
+function itemHasExactHost(item: LoginItem, h: string): boolean {
+  return item.uris.some((u) => host(/^[a-z]+:\/\//i.test(u) ? u : `https://${u}`) === h);
+}
+
+/** Ask unless the item is saved for exactly this host (not for TOTP) or the user said "always". */
+async function authorize(h: string, item: LoginItem, matches: boolean, otp: boolean, title: string, text: string): Promise<boolean> {
+  if (!alwaysAsk && (isTrusted(h, item.id) || (!otp && itemHasExactHost(item, h)))) return true;
+  const choice = await confirmChoice(title, text, matches);
+  if (choice === "always") trust(h, item.id, item.name);
+  return choice !== "deny";
+}
+
 function describeItem(i: LoginItem): string {
   return `${i.name} (id ${i.id}${i.username ? `, user ${i.username}` : ""}${i.hasTotp ? ", has TOTP" : ""})`;
+}
+
+type Picked = { item: LoginItem; matches: boolean } | { message: string };
+
+/** Choose the Bitwarden item for a URL, or explain why that is not possible. */
+async function pickItem(url: string, fieldHost: string, itemOpt?: string): Promise<Picked> {
+  let candidates = await itemsForUrl(url);
+  if (itemOpt) {
+    const byId = candidates.filter((c) => c.id === itemOpt);
+    const byName = candidates.filter((c) => c.name.toLowerCase().includes(itemOpt.toLowerCase()));
+    candidates = byId.length ? byId : byName;
+    if (!candidates.length) candidates = await searchItems(itemOpt);
+  }
+  if (!candidates.length) {
+    return { message: `No Bitwarden login item matches ${fieldHost}. Ask the user which item to use and pass it as \`item\` (name or id), or have them add the site's URL to the item.` };
+  }
+  if (candidates.length > 1 && !itemOpt) {
+    // Bitwarden matches on the base domain by default; prefer items saved for this exact host.
+    const exact = candidates.filter((c) =>
+      c.uris.some((u) => host(/^[a-z]+:\/\//i.test(u) ? u : `https://${u}`) === fieldHost),
+    );
+    if (exact.length >= 1) candidates = exact;
+  }
+  if (candidates.length > 1) {
+    return { message: `Several Bitwarden items match ${fieldHost}; call fill_login again with \`item\` set to one id:\n` +
+      candidates.map((c) => `- ${describeItem(c)}`).join("\n") };
+  }
+  return { item: candidates[0], matches: itemMatchesHost(candidates[0], fieldHost) };
+}
+
+/** fill_login for a pending HTTP auth challenge (Basic/Digest/NTLM), not a form. */
+async function fillHttpAuth(page: Page, ch: AuthChallenge, opts: FillOptions): Promise<string> {
+  const u = new URL(ch.url);
+  const h = u.hostname;
+  if (u.protocol === "http:" && !["localhost", "127.0.0.1"].includes(h)) {
+    throw new Error(`Refusing to send HTTP credentials over unencrypted http to ${h}.`);
+  }
+  const picked = await pickItem(ch.url, h, opts.item);
+  if ("message" in picked) return picked.message;
+  const { item, matches } = picked;
+  const warning = matches
+    ? ""
+    : `\n\n⚠ ACHTUNG: Der Eintrag ist NICHT für ${h} hinterlegt (${item.uris.join(", ") || "keine URL"}). Nur bestätigen, wenn das wirklich richtig ist!`;
+  const ok = await authorize(h, item, matches, false, "browser-mcp: Login ausfüllen?",
+    `Seite: ${h}\nHTTP-Anmeldung (${ch.scheme}), Bereich: ${ch.realm || "-"}\nEintrag: ${item.name}${item.username ? ` (${item.username})` : ""}${warning}`);
+  if (!ok) return "The user declined the login in the confirmation dialog. Do not retry unless they ask.";
+  const secrets = await secretsFor(item.id);
+  if (!secrets.username || !secrets.password) return `Item ${item.name} has no username and password.`;
+  const result = await answerAuth(page, secrets.username, secrets.password);
+  if (result === "gone") return "The login request is no longer pending. Call navigate again, then fill_login.";
+  if (result === "rejected") {
+    return `The server rejected the credentials from Bitwarden item "${item.name}" (HTTP ${ch.scheme}, realm "${ch.realm}"). Ask the user whether the item is up to date.`;
+  }
+  await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => undefined);
+  return `Answered the HTTP ${ch.scheme} login for ${h} (realm "${ch.realm}") with Bitwarden item "${item.name}".\n` +
+    `Now at: ${page.url()} (${await page.title().catch(() => "")}). Call snapshot to see the page.`;
 }
 
 export interface FillOptions {
@@ -82,6 +152,8 @@ export interface FillOptions {
 }
 
 export async function fillLogin(page: Page, opts: FillOptions): Promise<string> {
+  const challenge = pendingAuth(page);
+  if (challenge) return fillHttpAuth(page, challenge, opts);
   const url = page.url();
   const h = host(url);
   if (!/^https?:$/.test(new URL(url).protocol)) throw new Error("fill_login only works on http(s) pages.");
@@ -107,39 +179,16 @@ export async function fillLogin(page: Page, opts: FillOptions): Promise<string> 
   if (!target) return `No login fields found on ${url}. Take a snapshot: maybe a "Login" button has to be clicked first.`;
   const fieldHost = host(target.url()) || h;
 
-  // Pick the Bitwarden item.
-  let candidates = await itemsForUrl(target.url() || url);
-  if (opts.item) {
-    const byId = candidates.filter((c) => c.id === opts.item);
-    const byName = candidates.filter((c) => c.name.toLowerCase().includes(opts.item!.toLowerCase()));
-    candidates = byId.length ? byId : byName;
-    if (!candidates.length) candidates = await searchItems(opts.item);
-  }
-  if (!candidates.length) {
-    return `No Bitwarden login item matches ${fieldHost}. Ask the user which item to use and pass it as \`item\` (name or id), or have them add the site's URL to the item.`;
-  }
-  if (candidates.length > 1 && !opts.item) {
-    // Bitwarden matches on the base domain by default; prefer items saved for this exact host.
-    const exact = candidates.filter((c) =>
-      c.uris.some((u) => host(/^[a-z]+:\/\//i.test(u) ? u : `https://${u}`) === fieldHost),
-    );
-    if (exact.length >= 1) candidates = exact;
-  }
-  if (candidates.length > 1) {
-    return `Several Bitwarden items match ${fieldHost}; call fill_login again with \`item\` set to one id:\n` +
-      candidates.map((c) => `- ${describeItem(c)}`).join("\n");
-  }
-  const item = candidates[0];
-  const matches = itemMatchesHost(item, fieldHost);
+  const picked = await pickItem(target.url() || url, fieldHost, opts.item);
+  if ("message" in picked) return picked.message;
+  const { item, matches } = picked;
 
   const what = found.otp ? "Einmal-Code (TOTP)" : [found.user && "Benutzername", found.pass && "Passwort"].filter(Boolean).join(" + ");
   const warning = matches
     ? ""
     : `\n\n⚠ ACHTUNG: Der Eintrag ist NICHT für ${fieldHost} hinterlegt (${item.uris.join(", ") || "keine URL"}). Nur bestätigen, wenn das wirklich richtig ist!`;
-  const ok = await confirm(
-    "browser-mcp: Login ausfüllen?",
-    `Seite: ${fieldHost}\nEintrag: ${item.name}${item.username ? ` (${item.username})` : ""}\nFelder: ${what}${opts.submit ? "\nDanach absenden." : ""}${warning}`,
-  );
+  const ok = await authorize(fieldHost, item, matches, found.otp, "browser-mcp: Login ausfüllen?",
+    `Seite: ${fieldHost}\nEintrag: ${item.name}${item.username ? ` (${item.username})` : ""}\nFelder: ${what}${opts.submit ? "\nDanach absenden." : ""}${warning}`);
   if (!ok) return "The user declined the login in the confirmation dialog. Do not retry unless they ask.";
 
   const secrets = await secretsFor(item.id);

@@ -10,6 +10,9 @@ Browser use for Claude (Code and Desktop) over MCP, built for sites behind a log
   The server picks the matching Bitwarden item (`bw list items --url`, preferring items
   saved for the exact host), asks you in a local zenity dialog, then fills and submits the
   form itself. Passwords and TOTP codes never appear in tool output.
+- **HTTP auth too.** Sites behind a Basic/Digest login prompt (no form) are handled the same
+  way: `navigate` reports the challenge, `fill_login` answers it from Bitwarden after your
+  confirmation. Chrome then remembers it for the rest of the browser session.
 - **Self-unlocking vault.** The master password is asked once in a local dialog and kept in
   the Secret Service keyring (gnome-keyring), together with the current session key. After a
   reboot or `bw lock` the server unlocks on its own.
@@ -53,8 +56,11 @@ once with `bw login`), `zenity`, `secret-tool`.
 - Secrets stay inside the server process, but anything running as your user (including an
   agent with a shell) could still read the keyring or drive Chrome through the DevTools
   port. The design keeps secrets out of the agent's context; it is not a sandbox.
-- Every fill needs your click in the dialog, which names the site and the Bitwarden item and
-  warns when the item is not saved for that site. Credentials are never filled over plain
+- A fill needs your click in the dialog (it names the site and the Bitwarden item and warns when
+  the item is not saved for that site) unless the item has a URL on exactly that host, or you
+  chose "Immer erlauben" for that host + item (stored in `~/.local/share/browser-mcp/trust.json`;
+  delete an entry to revoke). One-time codes still ask unless you allowed that host + item.
+  `BROWSER_MCP_CONFIRM=always` asks every time. Credentials are never filled over plain
   http (except localhost).
 - To forget the stored master password:
   `secret-tool clear service browser-mcp key bw-master`
