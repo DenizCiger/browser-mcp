@@ -1,0 +1,23 @@
+{
+  "name": "browser-mcp",
+  "version": "0.1.0",
+  "description": "Browser-use MCP server with a persistent profile and Bitwarden-backed logins that never expose secrets to the agent",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "browser-mcp": "src/index.ts"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "playwright-core": "^1.65.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
